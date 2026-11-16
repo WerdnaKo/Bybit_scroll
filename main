@@ -1,0 +1,932 @@
+cat << 'EOF' > /root/solpulse_quant.py
+import os, sys, time, math, json, hmac, hashlib, sqlite3, threading
+import urllib.request, urllib.parse, concurrent.futures
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+DB_PATH = "/root/solpulse_quant.db"
+PORT = 8090
+SERVER_IP = "129.101.103.19"
+
+TAKER_FEE_RATE = 0.0010
+SOL_GAS_USD = 0.0025
+
+TOKENS = {
+    "SOL": (
+        "So11111111111111111111111111111111111111112",
+        "SOLUSDT", "SOL-USDT"
+    ),
+    "JUP": (
+        "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+        "JUPUSDT", "JUP-USDT"
+    ),
+    "RAY": (
+        "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+        "RAYUSDT", "RAY-USDT"
+    ),
+    "WIF": (
+        "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+        "WIFUSDT", "WIF-USDT"
+    ),
+    "BONK": (
+        "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+        "BONKUSDT", "BONK-USDT"
+    ),
+    "POPCAT": (
+        "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
+        "POPCATUSDT", "POPCAT-USDT"
+    ),
+    "MEW": (
+        "MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5",
+        "MEWUSDT", "MEW-USDT"
+    ),
+    "BOME": (
+        "ukHH6c7mMyiWCf1b9pnWe25TSpkDDt3H5pQZgZ74J82",
+        "BOMEUSDT", "BOME-USDT"
+    ),
+    "PENGU": (
+        "2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv",
+        "PENGUUSDT", "PENGU-USDT"
+    ),
+    "PYTH": (
+        "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
+        "PYTHUSDT", "PYTH-USDT"
+    ),
+    "TRUMP": (
+        "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",
+        "TRUMPUSDT", "TRUMP-USDT"
+    ),
+    "RENDER": (
+        "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof",
+        "RENDERUSDT", "RENDER-USDT"
+    )
+}
+
+HISTORY = {k: [] for k in TOKENS}
+LAST_GOOD_ROWS = {}
+
+STATE = {
+    "quant_rows": [],
+    "last_update": "Синхронизация стаканов...",
+    "bybit_ok": False,
+    "dex_ok": False,
+    "scan_count": 0,
+    "dex_ms": 0,
+    "last_action": "Ядро v5.2 (Big-Runner Edition) запущено..."
+}
+
+def db_con():
+    c = sqlite3.connect(DB_PATH, timeout=30)
+    c.execute("PRAGMA journal_mode=WAL;")
+    return c
+
+def init_db():
+    con = db_con()
+    cur = con.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS settings (
+        k TEXT PRIMARY KEY, v TEXT
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT,
+        strategy TEXT,
+        alpha_score REAL,
+        invest_usd REAL,
+        token_qty REAL DEFAULT 0.0,
+        entry_price REAL,
+        current_price REAL,
+        peak_price REAL,
+        target_price REAL,
+        stop_price REAL,
+        trailing_active INTEGER DEFAULT 0,
+        fees_paid REAL DEFAULT 0.0,
+        pnl_usd REAL,
+        pnl_pct REAL,
+        status TEXT,
+        close_reason TEXT,
+        opened_at TEXT,
+        opened_ts INTEGER
+    )""")
+    defaults = [
+        ("bankroll", "36.0"),
+        ("start_bank", "36.0"),
+        ("max_pos", "3"),
+        ("autopilot", "1"),
+        ("asocks_proxy", ""),
+        ("asocks_refresh", ""),
+        ("bybit_key", ""),
+        ("bybit_secret", ""),
+        ("live_bybit", "0")
+    ]
+    for k, v in defaults:
+        cur.execute(
+            "INSERT OR IGNORE INTO settings VALUES (?,?)", (k, v)
+        )
+    con.commit()
+    con.close()
+
+def get_set(k, d=""):
+    con = db_con()
+    r = con.execute(
+        "SELECT v FROM settings WHERE k=?", (k,)
+    ).fetchone()
+    con.close()
+    return r[0] if r else d
+
+def put_set(k, v):
+    con = db_con()
+    con.execute(
+        "INSERT OR REPLACE INTO settings VALUES (?,?)",
+        (k, str(v))
+    )
+    con.commit()
+    con.close()
+
+def http_get_json(url, timeout=6, use_proxy=False):
+    hdr = {"User-Agent": "Mozilla/5.0 SolPulseQuant/5.2"}
+    req = urllib.request.Request(url, headers=hdr)
+    px = get_set("asocks_proxy", "").strip() if use_proxy else ""
+    if px:
+        try:
+            ph = urllib.request.ProxyHandler(
+                {"http": px, "https": px}
+            )
+            op = urllib.request.build_opener(ph)
+            raw = op.open(req, timeout=timeout).read()
+            return json.loads(raw.decode("utf-8", "ignore"))
+        except Exception:
+            pass
+    raw = urllib.request.urlopen(req, timeout=timeout).read()
+    return json.loads(raw.decode("utf-8", "ignore"))
+
+def fetch_all_cex_orderbooks():
+    cex_book = {}
+    # 1. Bybit Spot Bid/Ask
+    for host, use_px in [
+        ("https://api.bytick.com", False),
+        ("https://api.bybit.com", True)
+    ]:
+        try:
+            u = host + "/v5/market/tickers?category=spot"
+            res = http_get_json(u, timeout=5, use_proxy=use_px)
+            for it in res.get("result", {}).get("list", []):
+                s = it.get("symbol", "")
+                if s == "RAYDIUMUSDT":
+                    s = "RAYUSDT"
+                lp = float(it.get("lastPrice", 0) or 0)
+                bid = float(it.get("bid1Price", 0) or lp)
+                ask = float(it.get("ask1Price", 0) or lp)
+                if lp > 0:
+                    cex_book[s] = {
+                        "last": lp,
+                        "bid": bid if bid > 0 else lp * 0.9995,
+                        "ask": ask if ask > 0 else lp * 1.0005
+                    }
+            if len(cex_book) >= 5:
+                break
+        except Exception:
+            pass
+
+    # 2. OKX Spot Bid/Ask
+    try:
+        u_ok = "https://www.okx.com/api/v5/market/tickers?instType=SPOT"
+        ok = http_get_json(u_ok, timeout=5, use_proxy=False)
+        for it in ok.get("data", []):
+            inst = it.get("instId", "").replace("-", "")
+            lp = float(it.get("last", 0) or 0)
+            bid = float(it.get("bidPx", 0) or lp)
+            ask = float(it.get("askPx", 0) or lp)
+            if lp > 0 and inst not in cex_book:
+                cex_book[inst] = {
+                    "last": lp,
+                    "bid": bid if bid > 0 else lp * 0.9995,
+                    "ask": ask if ask > 0 else lp * 1.0005
+                }
+    except Exception:
+        pass
+
+    # 3. Binance Spot bookTicker (гарантирует наличие всех 12 пар 24/7)
+    try:
+        u_bn = "https://api.binance.com/api/v3/ticker/bookTicker"
+        bn = http_get_json(u_bn, timeout=5, use_proxy=False)
+        for it in bn:
+            s = it.get("symbol", "")
+            bid = float(it.get("bidPrice", 0) or 0)
+            ask = float(it.get("askPrice", 0) or 0)
+            if bid > 0 and ask > 0 and s not in cex_book:
+                cex_book[s] = {
+                    "last": (bid + ask) * 0.5,
+                    "bid": bid,
+                    "ask": ask
+                }
+    except Exception:
+        pass
+
+    return cex_book
+
+def calc_amm_slippage_pct(order_usd, liq_usd):
+    if liq_usd <= 0:
+        return 5.0
+    half_pool = liq_usd * 0.5
+    return round((order_usd / (half_pool + order_usd)) * 100.0, 4)
+
+def calc_stats_zscore(sym, current_val, chg_m5, chg_h1):
+    arr = HISTORY.get(sym, [])
+    if not arr or abs(arr[-1] - current_val) > 1e-12 or len(arr) < 4:
+        arr.append(current_val)
+        if len(arr) > 30:
+            arr.pop(0)
+    HISTORY[sym] = arr
+
+    real_vol = max(
+        0.0050,
+        (abs(chg_m5) * 1.8 + abs(chg_h1) * 0.45) / 100.0
+    )
+    real_vol = min(0.060, real_vol)
+
+    if len(arr) >= 3:
+        mean = sum(arr) / len(arr)
+        var = sum((x - mean) ** 2 for x in arr) / len(arr)
+        std = math.sqrt(var)
+        if std > 1e-9:
+            z = (current_val - mean) / std
+            return round(max(-3.5, min(3.5, z)), 2), round(real_vol, 4)
+
+    expected_5m = chg_h1 / 12.0
+    denom = max(0.35, abs(chg_h1) * 0.25)
+    z_est = (chg_m5 - expected_5m) / denom
+    return round(max(-3.5, min(3.5, z_est)), 2), round(real_vol, 4)
+
+def calc_kelly_order_size(free_bank, total_eq, alpha_score):
+    con = db_con()
+    closed = con.execute(
+        "SELECT pnl_usd FROM trades WHERE status='CLOSED'"
+    ).fetchall()
+    con.close()
+    if len(closed) >= 4:
+        wins = [r[0] for r in closed if r[0] > 0]
+        win_rate = len(wins) / len(closed)
+    else:
+        win_rate = 0.60
+    conf = max(0.50, min(1.0, alpha_score / 85.0))
+    frac = 0.18 * conf * (0.85 + 0.35 * win_rate)
+    frac = max(0.16, min(0.25, frac))
+    kelly_usd = round(total_eq * frac, 2)
+    return min(free_bank, max(5.50, kelly_usd))
+
+def calc_quant_metrics(
+    sym, b_sym, d_px, c_book, liq, vol_m5, vol_h1,
+    chg_m5, chg_h1, buys, sells, dex_id, url, ref_order
+):
+    c_last = c_book["last"]
+    c_bid = c_book["bid"]
+    c_ask = c_book["ask"]
+
+    cex_book_spread_pct = ((c_ask - c_bid) / c_last) * 100.0
+    amm_slip_pct = calc_amm_slippage_pct(ref_order, liq)
+
+    exec_ask_px = d_px * (1.0 + (amm_slip_pct / 100.0) + 0.0003)
+    exec_bid_px = d_px * (1.0 - (amm_slip_pct / 100.0) - 0.0003)
+
+    signed_spread_pct = ((c_bid - exec_ask_px) / exec_ask_px) * 100.0
+    gas_pct = (SOL_GAS_USD / max(1.0, ref_order)) * 100.0
+    roundtrip_cost_pct = (
+        (TAKER_FEE_RATE * 200.0)
+        + (amm_slip_pct * 2.0)
+        + min(0.08, cex_book_spread_pct)
+        + gas_pct
+    )
+
+    tot_tx = max(1, buys + sells)
+    ofi = (buys - sells) / tot_tx
+    buy_pct = int((buys / tot_tx) * 100)
+
+    avg_5m_vol = max(1.0, vol_h1 / 12.0)
+    vol_accel = round(vol_m5 / avg_5m_vol, 2)
+
+    z_score, dyn_vol = calc_stats_zscore(
+        sym, d_px, chg_m5, chg_h1
+    )
+
+    arb_edge = (
+        signed_spread_pct * 0.75
+        if signed_spread_pct >= 0
+        else signed_spread_pct * 1.10
+    )
+    flow_edge = (
+        ((ofi * 0.90) + (max(0.0, chg_m5) * 0.30))
+        if vol_accel >= 0.25 else -0.15
+    )
+    if vol_accel >= 1.20 and ofi > 0.08:
+        flow_edge *= min(1.75, 0.90 + vol_accel * 0.25)
+
+    raw_expected_pct = arb_edge + flow_edge
+    net_ev_pct = round(raw_expected_pct - roundtrip_cost_pct, 3)
+    net_ev_usd = round(ref_order * (net_ev_pct / 100.0), 4)
+
+    score_arb = min(35.0, max(0.0, signed_spread_pct * 26.0))
+    score_ofi = max(-25.0, min(40.0, ofi * 55.0))
+    score_vel = min(18.0, vol_accel * 6.5) if ofi > 0 else 0.0
+    score_mom = max(-15.0, min(16.0, chg_m5 * 6.5))
+    alpha = round(
+        max(1.0, min(99.9, 28.0 + score_arb + score_ofi + score_vel + score_mom)),
+        1
+    )
+
+    if signed_spread_pct >= 0.22 and net_ev_pct > 0.08 and vol_accel >= 0.30:
+        strat = "STAT-ARB (RUNNER)"
+    elif ofi >= 0.12 and net_ev_pct > 0.08 and vol_accel >= 0.35:
+        strat = "OFI-MOMENTUM"
+    elif z_score <= -0.9 and ofi >= 0.08 and net_ev_pct > 0.05:
+        strat = "MEAN-REVERT"
+    elif ofi < -0.10:
+        strat = "DUMP-AVOID (SELL)"
+    else:
+        strat = "WAIT-NEUTRAL"
+
+    return {
+        "sym": sym,
+        "b_sym": b_sym,
+        "dex_name": dex_id,
+        "dex_price": d_px,
+        "exec_ask": exec_ask_px,
+        "exec_bid": exec_bid_px,
+        "cex_price": c_last,
+        "cex_bid": c_bid,
+        "cex_ask": c_ask,
+        "raw_spread": round(signed_spread_pct, 3),
+        "roundtrip_cost": round(roundtrip_cost_pct, 3),
+        "slippage": round(amm_slip_pct, 4),
+        "ofi": round(ofi, 2),
+        "buy_pct": buy_pct,
+        "buys": buys,
+        "sells": sells,
+        "vol_accel": vol_accel,
+        "z_score": z_score,
+        "dyn_vol": dyn_vol,
+        "alpha": alpha,
+        "net_ev_pct": net_ev_pct,
+        "net_ev_usd": net_ev_usd,
+        "liq": int(liq),
+        "chg_m5": round(chg_m5, 2),
+        "strategy": strat,
+        "url": url
+    }
+
+def run_quant_cycle():
+    cex_book = fetch_all_cex_orderbooks()
+    STATE["bybit_ok"] = len(cex_book) >= 5
+
+    items = list(TOKENS.items())
+    batches = [items[:4], items[4:8], items[8:]]
+    all_pairs = []
+
+    t0_dex = time.time()
+    def _fetch_batch(b_slice):
+        m_str = ",".join([v[0] for _, v in b_slice])
+        u_d = "https://api.dexscreener.com/latest/dex/tokens/" + m_str
+        return http_get_json(u_d, timeout=6, use_proxy=False).get("pairs", []) or []
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+            for res_p in ex.map(_fetch_batch, batches):
+                all_pairs.extend(res_p)
+    except Exception:
+        pass
+    STATE["dex_ms"] = int((time.time() - t0_dex) * 1000)
+    STATE["dex_ok"] = len(all_pairs) > 0
+
+    best = {}
+    preferred_dex = {"raydium", "orca", "meteora"}
+    for p in all_pairs:
+        if p.get("chainId") != "solana":
+            continue
+        addr = p.get("baseToken", {}).get("address", "")
+        dex_id_low = p.get("dexId", "").lower()
+        liq = float(p.get("liquidity", {}).get("usd", 0) or 0)
+        vol_h1 = float(p.get("volume", {}).get("h1", 0) or 0)
+        tx_h1 = p.get("txns", {}).get("h1", {})
+        tx_cnt = int(tx_h1.get("buys", 0) or 0) + int(tx_h1.get("sells", 0) or 0)
+
+        if liq < 20000 or tx_cnt < 8:
+            continue
+
+        dex_bonus = 2.0 if dex_id_low in preferred_dex else 0.5
+        activity_rank = (vol_h1 + (tx_cnt * 60.0)) * dex_bonus
+        if addr not in best or activity_rank > best[addr]["rank"]:
+            best[addr] = {
+                "rank": activity_rank,
+                "liq": liq,
+                "p": p
+            }
+
+    for sym, (mint, b_sym, _) in TOKENS.items():
+        inf = best.get(mint)
+        c_b = cex_book.get(b_sym)
+        if not inf or not c_b:
+            continue
+        p = inf["p"]
+        d_px = float(p.get("priceUsd", 0) or 0)
+        if d_px <= 0:
+            continue
+
+        dex_id = p.get("dexId", "raydium").upper()
+        url = p.get("url", "https://dexscreener.com")
+        vol_m5 = float(p.get("volume", {}).get("m5", 0) or 0)
+        vol_h1 = float(p.get("volume", {}).get("h1", 0) or 0)
+        chg_m5 = float(p.get("priceChange", {}).get("m5", 0) or 0)
+        chg_h1 = float(p.get("priceChange", {}).get("h1", 0) or 0)
+        tx = p.get("txns", {}).get("h1", {})
+        buys = int(tx.get("buys", 0) or 0)
+        sells = int(tx.get("sells", 0) or 0)
+
+        q = calc_quant_metrics(
+            sym, b_sym, d_px, c_b, inf["liq"],
+            vol_m5, vol_h1, chg_m5, chg_h1,
+            buys, sells, dex_id, url, 6.0
+        )
+        LAST_GOOD_ROWS[sym] = q
+
+    rows = list(LAST_GOOD_ROWS.values())
+    rows.sort(key=lambda x: (x["net_ev_pct"], x["alpha"]), reverse=True)
+    if rows:
+        STATE["quant_rows"] = rows
+    STATE["last_update"] = (
+        f"{time.strftime('%H:%M:%S')} | Пинг DEX: {STATE['dex_ms']} мс (Цикл 4.0с)"
+    )
+    STATE["scan_count"] += 1
+
+    if LAST_GOOD_ROWS:
+        execute_real_life_autopilot(LAST_GOOD_ROWS, rows)
+
+def execute_real_life_autopilot(live_map, ranked_rows):
+    con = db_con()
+    open_list = con.execute(
+        "SELECT id,symbol,strategy,invest_usd,token_qty,entry_price,"
+        "peak_price,target_price,stop_price,trailing_active,"
+        "fees_paid,opened_ts FROM trades WHERE status='OPEN'"
+    ).fetchall()
+
+    now_ts = int(time.time())
+    now_str = time.strftime("%H:%M:%S")
+    bank = float(get_set("bankroll", "36.0"))
+
+    # 1. 3-ступенчатый алгоритм удержания больших плюсовых сделок (Momentum Runner)
+    for tr in open_list:
+        (tid, sym, strat, inv, qty, ep, peak,
+         tp, sl, tr_act, fee_in, ots) = tr
+        if sym not in live_map or ep <= 0:
+            continue
+        q = live_map[sym]
+        sell_bid_px = q["exec_bid"]
+        new_peak = max(peak or ep, sell_bid_px)
+
+        if qty <= 0:
+            qty = (inv * (1.0 - TAKER_FEE_RATE)) / ep
+
+        # ЧЕСТНЫЙ РАСЧЕТ КОМИССИИ (строго 1 раз на вход и 1 раз на выход, без накопления!)
+        true_entry_fee = round(inv * TAKER_FEE_RATE + SOL_GAS_USD, 4)
+        gross_proceeds = qty * sell_bid_px
+        exit_fee = round(gross_proceeds * TAKER_FEE_RATE + SOL_GAS_USD, 4)
+        net_proceeds = gross_proceeds - exit_fee
+        total_fees = round(true_entry_fee + exit_fee, 4)
+
+        pnl = round(net_proceeds - inv, 4)
+        net_pct = round((pnl / inv) * 100.0, 2)
+        peak_gross = qty * new_peak
+        peak_net_pct = (((peak_gross - exit_fee) - inv) / inv) * 100.0
+        age = now_ts - int(ots or now_ts)
+
+        # СТУПЕНЬ 1: При +0.32% чистого профита ставим щит безубытка (+0.10% гарантировано), но НЕ закрываем сделку!
+        if net_pct >= 0.32 and tr_act == 0:
+            tr_act = 1
+            be_sl = ep * 1.0032
+            if be_sl > sl:
+                sl = be_sl
+
+        # СТУПЕНЬ 2: Пока покупатели давят стакан (OFI >= 0.08), даем сделке широкий коридор для роста
+        if tr_act >= 1:
+            if net_pct >= 1.20 or peak_net_pct >= 1.20:
+                tr_act = 2  # СТУПЕНЬ 3: Parabolic Runner (большой куш!)
+                trail_sl = new_peak * 0.9982
+            elif q["ofi"] >= 0.08:
+                trail_sl = new_peak * 0.9958  # Широкий шаг (0.42%), чтобы не выбило на откате
+            else:
+                trail_sl = new_peak * 0.9978  # Зажимаем шаг (0.22%), если покупки стихают
+            if trail_sl > sl:
+                sl = trail_sl
+
+        close_now = False
+        reason = ""
+        if sell_bid_px >= tp or net_pct >= 4.50:
+            close_now = True
+            reason = "🚀 Mega Runner Take-Profit"
+        elif tr_act == 2 and q["ofi"] < -0.05 and net_pct >= 0.85:
+            close_now = True
+            reason = "🔥 Пик импульса (Разворот стакана)"
+        elif tr_act >= 1 and sell_bid_px <= sl and net_pct >= 0.06:
+            close_now = True
+            reason = (
+                "🚀 Parabolic Profit Lock"
+                if tr_act == 2 else "🔒 Trailing Profit Lock"
+            )
+        elif sell_bid_px <= sl or net_pct <= -0.60:
+            close_now = True
+            reason = "🛡️ Короткий Stop-Loss (-0.60%)"
+        elif age >= 1200 and tr_act == 0:
+            close_now = True
+            reason = "🔄 Выход по времени (20м без импульса)"
+
+        if close_now:
+            bank = round(bank + inv + pnl, 4)
+            con.execute(
+                "INSERT OR REPLACE INTO settings VALUES ('bankroll', ?)",
+                (str(bank),)
+            )
+            con.execute(
+                "UPDATE trades SET current_price=?, peak_price=?, "
+                "stop_price=?, trailing_active=?, fees_paid=?, "
+                "pnl_usd=?, pnl_pct=?, status='CLOSED', close_reason=? "
+                "WHERE id=?",
+                (sell_bid_px, new_peak, sl, tr_act, total_fees,
+                 pnl, net_pct, reason, tid)
+            )
+            STATE["last_action"] = (
+                f"[{now_str}] Выход {sym}: "
+                f"{pnl:+.4f}$ ({net_pct:+.2f}%, Сборы: ${total_fees:.4f})"
+            )
+        else:
+            con.execute(
+                "UPDATE trades SET current_price=?, peak_price=?, "
+                "stop_price=?, trailing_active=?, fees_paid=?, "
+                "pnl_usd=?, pnl_pct=? WHERE id=?",
+                (sell_bid_px, new_peak, sl, tr_act, total_fees,
+                 pnl, net_pct, tid)
+            )
+
+    con.commit()
+
+    # 2. Строгий вход только в сильные импульсы
+    if get_set("autopilot", "1") == "1":
+        active = con.execute(
+            "SELECT symbol,invest_usd FROM trades WHERE status='OPEN'"
+        ).fetchall()
+        active_syms = {r[0] for r in active}
+        in_pos_sum = sum(r[1] for r in active)
+        total_eq = bank + in_pos_sum
+        max_pos = int(get_set("max_pos", "3"))
+
+        if len(active_syms) < max_pos and bank >= 5.50:
+            candidate = None
+            for r in ranked_rows:
+                if (
+                    r["sym"] not in active_syms
+                    and r["net_ev_pct"] >= 0.10
+                    and r["alpha"] >= 50.0
+                    and r["ofi"] >= 0.10
+                    and r["vol_accel"] >= 0.35
+                    and r["raw_spread"] >= -0.04
+                ):
+                    candidate = r
+                    break
+
+            if candidate:
+                csym = candidate["sym"]
+                cstrat = candidate["strategy"]
+                calpha = candidate["alpha"]
+                buy_ask_px = candidate["exec_ask"]
+                vol = candidate["dyn_vol"]
+
+                kelly_sz = calc_kelly_order_size(
+                    bank, total_eq, calpha
+                )
+                entry_fee = round(kelly_sz * TAKER_FEE_RATE + SOL_GAS_USD, 4)
+                net_invested = kelly_sz - entry_fee
+                token_qty = net_invested / buy_ask_px
+
+                instant_sell_bid = candidate["exec_bid"]
+                instant_exit_fee = round(
+                    (token_qty * instant_sell_bid) * TAKER_FEE_RATE + SOL_GAS_USD,
+                    4
+                )
+                init_pnl = round(
+                    (token_qty * instant_sell_bid - instant_exit_fee) - kelly_sz,
+                    4
+                )
+                init_pct = round((init_pnl / kelly_sz) * 100.0, 2)
+
+                # Верхняя цель открыта до +2.5%...+4.5%, а начальный стоп короткий (-0.50%)
+                tp = buy_ask_px * (1.0 + max(0.025, vol * 2.8))
+                sl = buy_ask_px * (1.0 - 0.0045)
+
+                bank = round(bank - kelly_sz, 4)
+                con.execute(
+                    "INSERT OR REPLACE INTO settings VALUES ('bankroll', ?)",
+                    (str(bank),)
+                )
+                con.execute(
+                    """INSERT INTO trades
+                    (symbol,strategy,alpha_score,invest_usd,token_qty,
+                     entry_price,current_price,peak_price,
+                     target_price,stop_price,trailing_active,fees_paid,
+                     pnl_usd,pnl_pct,status,close_reason,
+                     opened_at,opened_ts)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,0,?,?,?,'OPEN','В стакане',?,?)""",
+                    (csym, cstrat, calpha, kelly_sz, token_qty,
+                     buy_ask_px, instant_sell_bid, instant_sell_bid,
+                     tp, sl, entry_fee + instant_exit_fee, init_pnl, init_pct,
+                     now_str, now_ts)
+                )
+                con.commit()
+                STATE["last_action"] = (
+                    f"[{now_str}] 🧠 Вход по Ask {csym} на ${kelly_sz:.2f} "
+                    f"(Цель Runner до +4.5%, Стоп -0.60%)"
+                )
+            elif len(active_syms) == 0:
+                STATE["last_action"] = (
+                    f"[{now_str}] 🛡️ Ждем сильный импульс (Alpha >= 50, OFI >= +0.10, Net EV >= +0.10%)"
+                )
+
+    con.close()
+
+def quant_worker():
+    while True:
+        try:
+            run_quant_cycle()
+        except Exception:
+            pass
+        time.sleep(4)
+
+def fmt_px(p):
+    if p >= 1:
+        return f"${p:,.4f}"
+    if p >= 0.001:
+        return f"${p:.6f}"
+    return f"${p:.8f}"
+
+class FastThreadingServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+class QuantDashboard(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        return
+
+    def do_POST(self):
+        ln = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(ln).decode("utf-8", "ignore")
+        f = urllib.parse.parse_qs(body)
+        act = f.get("action", [""])[0]
+
+        if act == "toggle_auto":
+            cur = get_set("autopilot", "1")
+            put_set("autopilot", "0" if cur == "1" else "1")
+        elif act == "save_cfg":
+            put_set("asocks_proxy", f.get("asocks_proxy", [""])[0].strip())
+            put_set("bybit_key", f.get("bybit_key", [""])[0].strip())
+            put_set("bybit_secret", f.get("bybit_secret", [""])[0].strip())
+            put_set("live_bybit", f.get("live_bybit", ["0"])[0].strip())
+        elif act == "close_now":
+            tid = int(f.get("tid", ["0"])[0])
+            con = db_con()
+            r = con.execute(
+                "SELECT invest_usd,pnl_usd FROM trades "
+                "WHERE id=? AND status='OPEN'", (tid,)
+            ).fetchone()
+            if r:
+                b = float(get_set("bankroll", "36.0"))
+                put_set("bankroll", str(round(b + r[0] + r[1], 4)))
+                con.execute(
+                    "UPDATE trades SET status='CLOSED', "
+                    "close_reason='Ручная продажа по Bid' WHERE id=?",
+                    (tid,)
+                )
+                con.commit()
+            con.close()
+
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path.startswith("/api/health"):
+            con = db_con()
+            op_cnt = con.execute(
+                "SELECT COUNT(*) FROM trades WHERE status='OPEN'"
+            ).fetchone()[0]
+            con.close()
+            out = {
+                "ok": True,
+                "server_ip": SERVER_IP,
+                "engine": "SolPulse Quant v5.2 (Big-Runner Edition)",
+                "bybit_ok": STATE["bybit_ok"],
+                "dex_ok": STATE["dex_ok"],
+                "quant_pairs": len(STATE["quant_rows"]),
+                "open_positions": op_cnt,
+                "last_action": STATE["last_action"]
+            }
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(out).encode("utf-8"))
+            return
+
+        con = db_con()
+        open_tr = con.execute(
+            "SELECT id,symbol,strategy,alpha_score,invest_usd,token_qty,"
+            "entry_price,current_price,peak_price,target_price,"
+            "stop_price,trailing_active,fees_paid,pnl_usd,pnl_pct,opened_at "
+            "FROM trades WHERE status='OPEN' ORDER BY id DESC"
+        ).fetchall()
+        closed_tr = con.execute(
+            "SELECT id,symbol,strategy,alpha_score,invest_usd,token_qty,"
+            "entry_price,current_price,fees_paid,pnl_usd,pnl_pct,"
+            "close_reason,opened_at FROM trades "
+            "WHERE status='CLOSED' ORDER BY id DESC LIMIT 15"
+        ).fetchall()
+        wins_cnt = con.execute(
+            "SELECT COUNT(*) FROM trades "
+            "WHERE status='CLOSED' AND pnl_usd > 0"
+        ).fetchone()[0]
+        total_closed = con.execute(
+            "SELECT COUNT(*) FROM trades WHERE status='CLOSED'"
+        ).fetchone()[0]
+        total_fees_all = con.execute(
+            "SELECT COALESCE(SUM(fees_paid), 0) FROM trades WHERE status='CLOSED'"
+        ).fetchone()[0]
+        con.close()
+
+        free_cash = float(get_set("bankroll", "36.0"))
+        in_pos = sum(r[4] for r in open_tr)
+        unreal = sum(r[13] for r in open_tr)
+        equity = round(free_cash + in_pos + unreal, 4)
+        start_b = float(get_set("start_bank", "36.0"))
+        total_pnl = round(equity - start_b, 4)
+        win_rate = (
+            int((wins_cnt / total_closed) * 100)
+            if total_closed > 0 else 0
+        )
+        auto_on = get_set("autopilot", "1") == "1"
+
+        op_html = ""
+        for r in open_tr:
+            (tid, sym, stg, alp, inv, qty, ep, cp,
+             pk, tp, sl, tr_on, fee_p, pnl, pct, oat) = r
+            col = "#4ade80" if pnl >= 0 else "#f87171"
+            if tr_on == 2:
+                tr_badge = "<span style='color:#facc15;font-size:11px;font-weight:bold'>🚀 PARABOLIC RUNNER ВКЛ</span>"
+            elif tr_on == 1:
+                tr_badge = "<span style='color:#4ade80;font-size:11px'>🔒 Щит безубытка + Трал ВКЛ</span>"
+            else:
+                tr_badge = "<span style='color:#94a3b8;font-size:11px'>⏳ Короткий стоп (-0.60%)</span>"
+
+            op_html += f"""<tr>
+                <td><b>{sym}</b> <span style='color:#38bdf8'>[{stg}]</span><br>
+                    <small style='color:#facc15'>Alpha: {alp} | Кол-во: {qty:.4f}</small></td>
+                <td><b>${inv:.2f}</b><br><small style='color:#94a3b8'>Мин. лот Bybit OK</small></td>
+                <td>Покупка (Ask): {fmt_px(ep)}<br>Пик (Bid): {fmt_px(pk)}</td>
+                <td><b>Продажа (Bid): {fmt_px(cp)}</b><br><small style='color:#f87171'>Комиссия круга: -${fee_p:.4f}</small></td>
+                <td><small style='color:#4ade80'>Runner TP: {fmt_px(tp)}</small><br>
+                    <small style='color:#f87171'>SL: {fmt_px(sl)}</small><br>{tr_badge}</td>
+                <td style='color:{col};font-weight:bold;font-size:14px'>
+                    {pnl:+.4f}$ ({pct:+.2f}%)
+                </td>
+                <td>{oat}</td>
+                <td><form method='POST' style='margin:0'>
+                    <input type='hidden' name='action' value='close_now'>
+                    <input type='hidden' name='tid' value='{tid}'>
+                    <button type='submit' style='background:#eab308;color:#000;padding:5px 10px;font-size:12px'>Продать по Bid</button>
+                </form></td>
+            </tr>"""
+
+        cl_html = ""
+        for c in closed_tr:
+            tid, sym, stg, alp, inv, qty, ep, cp, fee_p, pnl, pct, rsn, oat = c
+            col = "#4ade80" if pnl >= 0 else "#f87171"
+            cl_html += f"""<tr>
+                <td><b>{sym}</b> [{stg}]</td>
+                <td>${inv:.2f} <small style='color:#94a3b8'>({qty:.2f} шт)</small></td>
+                <td>Ask {fmt_px(ep)} → Bid {fmt_px(cp)}</td>
+                <td style='color:#f87171'>-${fee_p:.4f}</td>
+                <td style='color:{col};font-weight:bold'>{pnl:+.4f}$ ({pct:+.2f}%)</td>
+                <td>{rsn}</td>
+                <td>{oat}</td>
+            </tr>"""
+
+        q_html = ""
+        for q in STATE["quant_rows"]:
+            a_col = (
+                "#4ade80" if q["alpha"] >= 50
+                else ("#facc15" if q["alpha"] >= 35 else "#94a3b8")
+            )
+            ev_col = "#4ade80" if q["net_ev_pct"] > 0 else "#f87171"
+            sp_col = "#4ade80" if q["raw_spread"] > 0.05 else (
+                "#f87171" if q["raw_spread"] < -0.05 else "#cbd5e1"
+            )
+            q_html += f"""<tr>
+                <td><b>{q['sym']}</b> <small style='color:#94a3b8'>({q['dex_name']})</small><br>
+                    <span style='color:#38bdf8;font-size:11px'>{q['strategy']}</span></td>
+                <td style='color:{a_col};font-weight:bold;font-size:15px'>{q['alpha']} / 100</td>
+                <td>Ask входа: {fmt_px(q['exec_ask'])}<br>CEX Bid/Ask: {fmt_px(q['cex_bid'])} / {fmt_px(q['cex_ask'])}</td>
+                <td>Спред: <b style='color:{sp_col}'>{q['raw_spread']:+.2f}%</b><br>
+                    <small style='color:#f87171'>Круг издержек: -{q['roundtrip_cost']:.2f}%</small></td>
+                <td>OFI: <b>{q['ofi']:+.2f}</b> ({q['buy_pct']}% Buy)<br>
+                    <small style='color:#cbd5e1'>Ускорение V: {q['vol_accel']}x | 5м: {q['chg_m5']:+.2f}%</small></td>
+                <td>Z-Score: <b>{q['z_score']:+.2f}σ</b><br>
+                    <small style='color:#94a3b8'>Волат-сть: {q['dyn_vol']*100:.2f}%</small></td>
+                <td style='color:{ev_col};font-weight:bold'>
+                    {q['net_ev_pct']:+.2f}%<br>
+                    <small>({q['net_ev_usd']:+.4f}$)</small>
+                </td>
+                <td>${q['liq']:,}</td>
+            </tr>"""
+
+        btn_txt = (
+            "🟢 BIG-RUNNER АВТОПИЛОТ АКТИВЕН (24/7)"
+            if auto_on else "🔴 АВТОПИЛОТ НА ПАУЗЕ"
+        )
+        btn_col = "#16a34a" if auto_on else "#dc2626"
+        p_col = "#4ade80" if total_pnl >= 0 else "#f87171"
+
+        html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+        <meta http-equiv='refresh' content='5'>
+        <title>SolPulse Quant v5.2 (Big-Runner) — {SERVER_IP}</title>
+        <style>
+            body {{background:#070a12;color:#f8fafc;font-family:system-ui,sans-serif;margin:0;padding:18px;max-width:1360px;margin:auto}}
+            .top {{display:flex;justify-content:space-between;align-items:center;background:#0f172a;padding:16px 22px;border-radius:12px;border:1px solid #1e293b;margin-bottom:16px}}
+            .grid4 {{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:16px}}
+            .card {{background:#0f172a;padding:16px;border-radius:12px;border:1px solid #1e293b;margin-bottom:16px}}
+            .val {{font-size:25px;font-weight:bold;margin-top:6px}}
+            table {{width:100%;border-collapse:collapse;margin-top:8px}}
+            th,td {{padding:9px;border-bottom:1px solid #1e293b;text-align:left;font-size:12.5px}}
+            th {{background:#090d16;color:#94a3b8}}
+            input,select {{padding:8px;background:#070a12;color:#fff;border:1px solid #334155;border-radius:6px;width:100%;box-sizing:border-box}}
+            button {{background:#2563eb;color:#fff;border:none;padding:9px 15px;border-radius:6px;font-weight:bold;cursor:pointer}}
+        </style></head><body>
+        <div class='top'>
+            <div>
+                <h2 style='margin:0'>🚀 SolPulse Quant v5.2 — 3-Stage Momentum Runner ({SERVER_IP})</h2>
+                <div style='color:#38bdf8;font-size:13px;margin-top:4px'>Статус ядра: <b>{STATE['last_action']}</b> | Цикл #{STATE['scan_count']} ({STATE['last_update']})</div>
+            </div>
+            <form method='POST' style='margin:0'>
+                <input type='hidden' name='action' value='toggle_auto'>
+                <button type='submit' style='background:{btn_col};padding:12px 18px;font-size:14px'>{btn_txt}</button>
+            </form>
+        </div>
+
+        <div class='grid4'>
+            <div class='card' style='margin:0'>Ликвидный Капитал (По Bid)<div class='val' style='color:#4ade80'>${equity:.4f}</div><small style='color:#94a3b8'>Кэш: ${free_cash:.2f} | В сделках: ${in_pos:.2f}</small></div>
+            <div class='card' style='margin:0'>Чистый Профит (После всех сборов)<div class='val' style='color:{p_col}'>{total_pnl:+.4f} $</div><small style='color:#94a3b8'>WinRate: {win_rate}% (Закрыто: {total_closed} | Сборы: ${total_fees_all:.4f})</small></div>
+            <div class='card' style='margin:0'>Активных Слотов ({len(STATE['quant_rows'])} пулов)<div class='val' style='color:#38bdf8'>{len(open_tr)} / 3</div><small style='color:#94a3b8'>Короткий стоп -0.60% • Цель до +4.5%</small></div>
+            <div class='card' style='margin:0'>Алгоритм Удержания Плюса<div class='val' style='font-size:16px;color:#facc15'>3-Stage OFI Runner</div><small style='color:#4ade80'>Без раннего обрезания прибыли</small></div>
+        </div>
+
+        <div class='card'>
+            <h3 style='margin-top:0'>⚡ Открытые позиции (3-ступенчатый трал: Безубыток &rarr; OFI-Hold &rarr; Parabolic Lock)</h3>
+            <table>
+                <tr><th>Актив / Кол-во монет</th><th>Ордер (&ge;$5.50)</th><th>Покупка (Ask) / Пик</th><th>Продажа (Bid) / Сборы</th><th>Цели (Runner TP / SL)</th><th>Чистый PnL на руки</th><th>Время</th><th>Действие</th></tr>
+                {op_html or f"<tr><td colspan='8' style='color:#94a3b8'>{STATE['last_action']}</td></tr>"}
+            </table>
+        </div>
+
+        <div class='card'>
+            <h3 style='margin-top:0'>💰 Журнал закрытых сделок (С точным расчетом разовой комиссии круга)</h3>
+            <table>
+                <tr><th>Актив</th><th>Ордер (Кол-во)</th><th>Покупка (Ask) → Продажа (Bid)</th><th>Комиссия круга</th><th>Чистый Итог на баланс</th><th>Причина выхода</th><th>Время</th></tr>
+                {cl_html or "<tr><td colspan='7' style='color:#94a3b8'>Журнал очищен под алгоритм v5.2 Big-Runner.</td></tr>"}
+            </table>
+        </div>
+
+        <div class='card'>
+            <h3 style='margin-top:0'>📊 Квантовая Матрица Стаканов (Все 12 пар: Bybit + Binance + OKX + Solana DEX)</h3>
+            <table>
+                <tr><th>Монета / Сигнал</th><th>Alpha Score</th><th>Стакан (Ask Входа / CEX Bid-Ask)</th><th>Спред и Круг Издержек</th><th>Поток Ордеров (OFI / Импульс)</th><th>Статистика (Z-Score / σ)</th><th>Чистое Мат.Ожидание (Net EV)</th><th>Ликвидность</th></tr>
+                {q_html}
+            </table>
+        </div>
+        </body></html>"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(html.encode("utf-8"))
+
+if __name__ == "__main__":
+    init_db()
+    if "--reset-clean" in sys.argv:
+        con = db_con()
+        con.execute("DELETE FROM trades;")
+        con.execute("INSERT OR REPLACE INTO settings VALUES ('bankroll', '36.0');")
+        con.execute("INSERT OR REPLACE INTO settings VALUES ('start_bank', '36.0');")
+        con.execute("INSERT OR REPLACE INTO settings VALUES ('max_pos', '3');")
+        con.commit()
+        con.close()
+        print("БАЗА ОЧИЩЕНА ПОД АЛГОРИТМ V5.2 BIG-RUNNER ($36.0000)!")
+        sys.exit(0)
+    run_quant_cycle()
+    threading.Thread(target=quant_worker, daemon=True).start()
+    FastThreadingServer(("0.0.0.0", PORT), QuantDashboard).serve_forever()
+EOF
+python3 -m py_compile /root/solpulse_quant.py && echo "=== СИНТАКСИС V5.2 OK ==="
+python3 /root/solpulse_quant.py --reset-clean
+systemctl restart solpulse-quant
+sleep 3
+curl -s http://127.0.0.1:8090/api/health && echo -e "\n=== ГОТОВО! ОБНОВИ СТРАНИЦУ http://129.101.103.19:8090 ==="
